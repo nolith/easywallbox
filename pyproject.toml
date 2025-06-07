@@ -1,0 +1,31 @@
+[project]
+name = "easywallbox"
+version = "0.1.0"
+description = "EasyWallbox Free2Move Python Mqtt Manager / Monitor"
+authors = [{ name = "Mihai Stana", email = "2051364+mihaistana@users.noreply.github.com" }]
+requires-python = ">=3.9"
+
+dependencies = [
+    "bleak",
+    "paho-mqtt<2.0.0"
+]
+
+[project.scripts]
+easywallbox-mqtt = "easywallbox:cli_main"
+easywallbox-terminal = "terminal:main"
+ble_scan = "scan:main"
+
+[tool.setuptools]
+py-modules = [
+    "easywallbox",
+    "scan",
+    "blemap",
+    "commands",
+    "mqttmap",
+    "readinfo",
+    "terminal"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

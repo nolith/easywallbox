@@ -94,7 +94,7 @@ async def main():
     mqtt_username = os.getenv('MQTT_USERNAME', "")
     mqtt_password = os.getenv('MQTT_PASSWORD', "")
 
-    
+
     queue = asyncio.Queue()
 
     eb = EasyWallbox(queue)
@@ -179,10 +179,11 @@ async def main():
             await eb.write(item)
         await asyncio.sleep(1)
 
-try:
-    asyncio.run(main())
-except asyncio.CancelledError:
-    pass
-#except Exception as e:
-#    print(str(e), file=sys.stderr, flush=True)
-#    sys.exit(1)
+def cli_main():
+  try:
+      asyncio.run(main())
+  except asyncio.CancelledError:
+      pass
+
+if __name__ == "__main__":
+    cli_main()
