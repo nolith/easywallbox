@@ -2,7 +2,10 @@
 name = "easywallbox"
 version = "0.1.0"
 description = "EasyWallbox Free2Move Python Mqtt Manager / Monitor"
-authors = [{ name = "Mihai Stana", email = "2051364+mihaistana@users.noreply.github.com" }]
+authors = [
+  { name = "Mihai Stana", email = "2051364+mihaistana@users.noreply.github.com" },
+  { name = "Alessio Caiazza", email = "code.git@caiazza.info" }
+]
 requires-python = ">=3.9"
 
 dependencies = [
