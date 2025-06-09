@@ -24,6 +24,7 @@ log.setLevel(logging.INFO)
 EVCC_STATUS_SOURCE = "easywallbox/ble/AD/4"
 EVCC_ENABLED_SOURCE = "easywallbox/ble/IDX/158" # Wallbox DPM limit
 EVCC_COMMAND_MAXCURRENT = "easywallbox/evcc/maxcurrent"
+EVCC_COMMAND_MAXCURRENTMILLIS = "easywallbox/evcc/maxcurrentmillis"
 EVCC_COMMAND_ENABLE = "easywallbox/evcc/enable"
 EVCC_STATUS_AVAILABLE = "A"
 EVCC_STATUS_VEHICLE_PRESENT = "B"
@@ -206,7 +207,7 @@ async def main():
             ,(EVCC_STATUS_SOURCE, 0)
             ,(EVCC_ENABLED_SOURCE, 0)
             # evcc - commands
-            ,(EVCC_COMMAND_MAXCURRENT, 0), (EVCC_COMMAND_ENABLE, 0)
+            ,(EVCC_COMMAND_MAXCURRENT, 0), (EVCC_COMMAND_MAXCURRENTMILLIS, 0), (EVCC_COMMAND_ENABLE, 0)
             ])
 
 
@@ -240,7 +241,10 @@ async def main():
                 return
             elif topic == EVCC_COMMAND_MAXCURRENT:
                 max_current = int(message)
-                ble_command = commands.setUserLimit(max_current)
+                ble_command = commands.setUserLimit(max_current, millis=False)
+            elif topic == EVCC_COMMAND_MAXCURRENTMILLIS:
+                max_current = int(message)
+                ble_command = commands.setUserLimit(max_current, millis=True)
 
             elif "settings/" in topic:
                 opt = topic.split("/", maxsplit=1)[1]

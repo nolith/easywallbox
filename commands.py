@@ -2,9 +2,10 @@
 import blemap as bmap
 
 
-def setUserLimit(limit):
-    
-    limitValue = limit * 10
+def setUserLimit(limit, millis=False):
+    limitValue = limit
+    if not millis:
+        limitValue *= 10
     return bmap.WALLBOX_EPROM["SET_USER_LIMIT"].format(limit = str(limitValue))
     
 def setDpmLimit(limit):
