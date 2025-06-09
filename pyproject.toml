@@ -19,10 +19,12 @@ ble_scan = "scan:main"
 py-modules = [
     "easywallbox",
     "scan",
+    "settings",
     "blemap",
     "commands",
     "mqttmap",
     "readinfo",
+    "repeating_timer",
     "terminal"
 ]
 
