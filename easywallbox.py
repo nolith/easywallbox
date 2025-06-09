@@ -38,6 +38,8 @@ settings = settings.Settings()
 class EasyWallbox:
     WALLBOX_ADDRESS = os.getenv('WALLBOX_ADDRESS', '8C:F6:81:AD:B8:3E')
     WALLBOX_PIN = os.getenv('WALLBOX_PIN', '9844')
+    WALLBOX_DPM_LIMIT = int(os.getenv('WALLBOX_DPM_LIMIT', '26'))
+    WALLBOX_USER_LIMIT = int(os.getenv('WALLBOX_USER_LIMIT', '23'))
 
     WALLBOX_RX = "a9da6040-0823-4995-94ec-9ce41ca28833";
     WALLBOX_SERVICE = "331a36f5-2459-45ea-9d95-6142f0c4b307";
@@ -50,6 +52,7 @@ class EasyWallbox:
         self._queue = queue
         self._lock = asyncio.Lock()
         self.connecting = False
+        self.terminating = False
         self.state_timer = RepeatingTimer(self._update_ble_state)
         self._evcc_enabled = True
 
@@ -59,6 +62,12 @@ class EasyWallbox:
     async def is_connecting(self):
       async with self._lock:
         return self.connecting
+
+    async def stop(self):
+      async with self._lock:
+        self.terminating = True
+        client.publish("easywallbox/status/ble", "terminating")
+        self.state_timer.stop()
 
     async def write(self, data):
         if isinstance(data, str):
@@ -70,8 +79,12 @@ class EasyWallbox:
         global client
         try:
             async with self._lock:
-              self.connecting = True
-              client.publish("easywallbox/status/ble", "connecting")
+                if self.terminating:
+                    log.warning("Terminating state, will not connect")
+                    return
+
+                self.connecting = True
+                client.publish("easywallbox/status/ble", "connecting")
             log.info("Connecting BLE...")
             await self._client.connect()
             log.info(f"Connected on {self.WALLBOX_ADDRESS}: {self._client.is_connected}")
@@ -126,13 +139,19 @@ class EasyWallbox:
         await self._enqueue_ble_command("READ_SUPPLY_VOLTAGE")
 
     def evcc_enable(self, enable=True):
+        if self.terminating:
+            log.warning("Termitating state, ignoring evcc enable command")
+            return
+        
         self._evcc_enabled = enable
         if enable:
-            self._queue.put_nowait(commands.setDpmLimit(26*2))
+            self._queue.put_nowait(commands.setDpmOff())
+            self._queue.put_nowait(commands.setDpmLimit(self.WALLBOX_DPM_LIMIT))
         else:
             # this is very tricky - I could not find a way to disable/pause a charge process
             # so the only way is set the limit to 1A so that the DPM will not allow the charge to start
             self._queue.put_nowait(commands.setDpmLimit(1))
+            self._queue.put_nowait(commands.setDpmOn())
 
     def dpm_limit_changed(self, new_limit):
         self._evcc_enabled = new_limit != "10"
@@ -276,15 +295,19 @@ async def main():
 
     async def on_exit():
         log.info("Shutting down")
-        eb.state_timer.stop()
+        eb.stop()
         client.publish("easywallbox/status/general", "offline", qos=1)
         client.publish("easywallbox/evcc/enabled", "false", qos=1)
         # restore limits
-        queue.put_nowait(commands.setDpmLimit(27))
-        queue.put_nowait(commands.setUserLimit(26))
+        if eb.is_connected():
+            queue.put_nowait(commands.setDpmLimit(eb.WALLBOX_DPM_LIMIT))
+            queue.put_nowait(commands.setDpmOn())
+            queue.put_nowait(commands.setUserLimit(eb.WALLBOX_USER_LIMIT))
+            await asyncio.sleep(5)
+            await eb._client.disconnect()
+        else:
+            log.warninig("Cannot restore default limits, not connected")
 
-        await asyncio.sleep(5)
-        await eb._client.disconnect()
         sys.exit(0)
 
     mqtt.Client.connected_flag=False
