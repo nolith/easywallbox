@@ -246,7 +246,7 @@ async def main():
                 evcc_status = EVCC_STATUS_ERROR
                 if status_code == 3:
                     evcc_status =  EVCC_STATUS_AVAILABLE
-                elif status_code == 6:
+                elif status_code == 6 or status_code == 5:
                     evcc_status = EVCC_STATUS_VEHICLE_PRESENT
                 elif status_code == 8:
                     evcc_status = EVCC_STATUS_CHARGING
