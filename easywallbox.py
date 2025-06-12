@@ -142,7 +142,7 @@ class EasyWallbox:
         if self.terminating:
             log.warning("Termitating state, ignoring evcc enable command")
             return
-        
+
         self._evcc_enabled = enable
         if enable:
             self._queue.put_nowait(commands.setDpmOff())
@@ -259,7 +259,8 @@ async def main():
                 eb.evcc_enable(message == "true")
                 return
             elif topic == EVCC_COMMAND_MAXCURRENT:
-                max_current = int(message)
+                # evcc will send a float number, multiply by 10 to get mA
+                max_current = int(round(float(message)*10))
                 ble_command = commands.setUserLimit(max_current, millis=False)
             elif topic == EVCC_COMMAND_MAXCURRENTMILLIS:
                 max_current = int(message)
