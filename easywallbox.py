@@ -7,12 +7,15 @@ import os
 import commands
 import mqttmap
 import time
-import atexit
 import signal
 import logging
 import settings
 from repeating_timer import RepeatingTimer
 from blemap import WALLBOX_EPROM as eeprom
+import threading
+
+_cleanup_lock = threading.Lock()
+_cleanup_ran = False
 
 FORMAT = ('%(asctime)-15s %(threadName)-15s '
           '%(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s')
@@ -39,7 +42,6 @@ class EasyWallbox:
     WALLBOX_ADDRESS = os.getenv('WALLBOX_ADDRESS', '8C:F6:81:AD:B8:3E')
     WALLBOX_PIN = os.getenv('WALLBOX_PIN', '9844')
     WALLBOX_DPM_LIMIT = int(os.getenv('WALLBOX_DPM_LIMIT', '26'))
-    WALLBOX_USER_LIMIT = int(os.getenv('WALLBOX_USER_LIMIT', '23'))
 
     WALLBOX_RX = "a9da6040-0823-4995-94ec-9ce41ca28833";
     WALLBOX_SERVICE = "331a36f5-2459-45ea-9d95-6142f0c4b307";
@@ -64,10 +66,12 @@ class EasyWallbox:
         return self.connecting
 
     async def stop(self):
+      await self._queue.put(commands.logout())
       async with self._lock:
         self.terminating = True
         client.publish("easywallbox/status/ble", "terminating")
         self.state_timer.stop()
+        await self._client.disconnect()
 
     async def write(self, data):
         if isinstance(data, str):
@@ -80,7 +84,7 @@ class EasyWallbox:
         try:
             async with self._lock:
                 if self.terminating:
-                    log.warning("Terminating state, will not connect")
+                    log.warn("Terminating state, will not connect")
                     return
 
                 self.connecting = True
@@ -140,7 +144,7 @@ class EasyWallbox:
 
     def evcc_enable(self, enable=True):
         if self.terminating:
-            log.warning("Termitating state, ignoring evcc enable command")
+            log.warn("Terminating state, ignoring evcc enable command")
             return
 
         self._evcc_enabled = enable
@@ -161,7 +165,7 @@ class EasyWallbox:
 
 
     _notification_buffer_rx = ""
-    def _notification_handler_rx(self, sender, data):
+    async def _notification_handler_rx(self, sender, data):
         global client
         self._notification_buffer_rx += data.decode()
         if "\n" in self._notification_buffer_rx:
@@ -176,10 +180,10 @@ class EasyWallbox:
                         if key in ["AL", "SL", "IDX"]:
                             key += f"/{data[0]}"
                             data = ",".join(data[1:])
-                            client.publish(topic=f"easywallbox/ble/{key}", payload=data, qos=1, retain=True)
+                            client.publish(topic=f"easywallbox/ble/{key}", payload=data, qos=1, retain=False)
                         else:
                             for idx, value in enumerate(data):
-                                client.publish(topic=f"easywallbox/ble/{key}/{idx}", payload=value, qos=1, retain=True)
+                                client.publish(topic=f"easywallbox/ble/{key}/{idx}", payload=value, qos=1, retain=False)
             #self._queue.put_nowait(self._notification_buffer_rx)
             finally:
                 self._notification_buffer_rx = "";
@@ -188,7 +192,7 @@ class EasyWallbox:
         #self._queue.put_nowait(data.decode('utf-8'))
 
     _notification_buffer_st = ""
-    def _notification_handler_st(self, sender, data):
+    async def _notification_handler_st(self, sender, data):
 
         self._notification_buffer_st += data.decode()
         if "\n" in self._notification_buffer_st:
@@ -251,7 +255,7 @@ async def main():
                 elif status_code == 8:
                     evcc_status = EVCC_STATUS_CHARGING
                 else:
-                    log.warning(f"Unknown EVCC status: {status_code}")
+                    log.warn(f"Unknown EVCC status: {status_code}")
                 client.publish("easywallbox/evcc/status", evcc_status, qos=0, retain=False)
                 client.publish("easywallbox/evcc/enabled", eb.is_evcc_enabled(), qos=0, retain=False)
                 return
@@ -295,21 +299,18 @@ async def main():
             queue.put_nowait(ble_command)
 
     async def on_exit():
-        log.info("Shutting down")
-        eb.stop()
-        client.publish("easywallbox/status/general", "offline", qos=1)
-        client.publish("easywallbox/evcc/enabled", "false", qos=1)
-        # restore limits
-        if eb.is_connected():
-            queue.put_nowait(commands.setDpmLimit(eb.WALLBOX_DPM_LIMIT))
-            queue.put_nowait(commands.setDpmOn())
-            queue.put_nowait(commands.setUserLimit(eb.WALLBOX_USER_LIMIT))
-            await asyncio.sleep(5)
-            await eb._client.disconnect()
-        else:
-            log.warninig("Cannot restore default limits, not connected")
+        global _cleanup_ran
+        with _cleanup_lock:
+            if _cleanup_ran:
+                return
+            
+            _cleanup_ran = True
+            log.info("Shutting down")
+            await eb.stop()
+            client.publish("easywallbox/status/general", "offline", qos=1)
+            client.publish("easywallbox/evcc/enabled", "false", qos=1)
 
-        sys.exit(0)
+            sys.exit(0)
 
     mqtt.Client.connected_flag=False
 
@@ -330,7 +331,6 @@ async def main():
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGINT,
                             lambda: asyncio.create_task(on_exit()))
-    atexit.register(on_exit)
 
 
     #def read_line():
