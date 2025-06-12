@@ -7,12 +7,15 @@ import os
 import commands
 import mqttmap
 import time
-import atexit
 import signal
 import logging
 import settings
 from repeating_timer import RepeatingTimer
 from blemap import WALLBOX_EPROM as eeprom
+import threading
+
+_cleanup_lock = threading.Lock()
+_cleanup_ran = False
 
 FORMAT = ('%(asctime)-15s %(threadName)-15s '
           '%(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s')
@@ -39,7 +42,6 @@ class EasyWallbox:
     WALLBOX_ADDRESS = os.getenv('WALLBOX_ADDRESS', 'demo')
     WALLBOX_PIN = os.getenv('WALLBOX_PIN', '9844')
     WALLBOX_DPM_LIMIT = int(os.getenv('WALLBOX_DPM_LIMIT', '26'))
-    WALLBOX_USER_LIMIT = int(os.getenv('WALLBOX_USER_LIMIT', '23'))
 
     WALLBOX_RX = "a9da6040-0823-4995-94ec-9ce41ca28833";
     WALLBOX_SERVICE = "331a36f5-2459-45ea-9d95-6142f0c4b307";
@@ -68,10 +70,12 @@ class EasyWallbox:
         return self.connecting
 
     async def stop(self):
+      await self._queue.put(commands.logout())
       async with self._lock:
         self.terminating = True
         await self._mqtt_client.publish(f"{TOPIC}status/ble", "terminating")
         self.state_timer.stop()
+        await self._client.disconnect()
 
     async def write(self, data):
         if isinstance(data, str):
@@ -88,7 +92,7 @@ class EasyWallbox:
         try:
             async with self._lock:
                 if self.terminating:
-                    log.warning("Terminating state, will not connect")
+                    log.warn("Terminating state, will not connect")
                     return
 
                 self.connecting = True
@@ -148,7 +152,7 @@ class EasyWallbox:
 
     async def evcc_enable(self, enable=True):
         if self.terminating:
-            log.warning("Termitating state, ignoring evcc enable command")
+            log.warn("Terminating state, ignoring evcc enable command")
             return
 
         self._evcc_enabled = enable
@@ -182,10 +186,10 @@ class EasyWallbox:
                     if key in ["AL", "SL", "IDX"]:
                         key += f"/{data[0]}"
                         data = ",".join(data[1:])
-                        await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}", payload=data, qos=1, retain=True)
+                        await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}", payload=data, qos=1, retain=False)
                     else:
                         for idx, value in enumerate(data):
-                            await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}/{idx}", payload=value, qos=1, retain=True)
+                            await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}/{idx}", payload=value, qos=1, retain=False)
             #self._queue.put_nowait(self._notification_buffer_rx)
             finally:
                 self._notification_buffer_rx = "";
@@ -240,12 +244,12 @@ async def main():
                     evcc_status = EVCC_STATUS_ERROR
                     if status_code == 3:
                         evcc_status =  EVCC_STATUS_AVAILABLE
-                    elif status_code == 6:
+                    elif status_code == 6 or status_code == 5:
                         evcc_status = EVCC_STATUS_VEHICLE_PRESENT
                     elif status_code == 8:
                         evcc_status = EVCC_STATUS_CHARGING
                     else:
-                        log.warning(f"Unknown EVCC status: {status_code}")
+                        log.warn(f"Unknown EVCC status: {status_code}")
                     await client.publish(f"{TOPIC}/evcc/status", evcc_status, qos=0, retain=False)
                     await client.publish(f"{TOPIC}/evcc/enabled", eb.is_evcc_enabled(), qos=0, retain=False)
                     break
@@ -256,7 +260,8 @@ async def main():
                     max_current = int(message)
                     ble_command = commands.setUserLimit(max_current, millis=False)
                 elif topic == EVCC_COMMAND_MAXCURRENTMILLIS:
-                    max_current = int(message)
+                    # evcc will send a float number, multiply by 10 to get mA
+                    max_current = int(round(float(message)*10))
                     ble_command = commands.setUserLimit(max_current, millis=True)
 
                 elif "settings/" in topic:
@@ -313,19 +318,16 @@ async def main():
         )
 
 async def on_exit(client, eb, queue):
+    global _cleanup_ran
+    with _cleanup_lock:
+        if _cleanup_ran:
+            return
+
+        _cleanup_ran = True
     log.info("Shutting down")
     eb.stop()
     await client.publish(f"{TOPIC}/status/general", "offline", qos=1)
     await client.publish(f"{TOPIC}/evcc/enabled", "false", qos=1)
-    # restore limits
-    if eb.is_connected():
-        await queue.put(commands.setDpmLimit(eb.WALLBOX_DPM_LIMIT))
-        await queue.put(commands.setDpmOn())
-        await queue.put(commands.setUserLimit(eb.WALLBOX_USER_LIMIT))
-        await asyncio.sleep(5)
-        await eb._client.disconnect()
-    else:
-        log.warn("Cannot restore default limits, not connected")
 
     sys.exit(0)
 

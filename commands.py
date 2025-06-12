@@ -34,3 +34,6 @@ def setDpmOn():
 def authBle(pin="0000"): #9844 
     return bmap.WALLBOX_BLE["LOGIN"].format(pin = str(pin))
 
+def logout():
+    return bmap.WALLBOX_BLE["LOGOUT"]
+
