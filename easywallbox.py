@@ -23,13 +23,12 @@ FORMAT = ('%(asctime)-15s %(threadName)-15s '
           '%(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s')
 logging.basicConfig(format=FORMAT)
 log = logging.getLogger()
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 TOPIC = os.getenv('WALLBOX_TOPIC', 'easywallbox')
 HOME_ASSISTANT_DISCOVERY = os.getenv('HOME_ASSISTANT_DISCOVERY', 'homeassistant')
 
 EVCC_STATUS_SOURCE = f"{TOPIC}/ble/AD/4"
-EVCC_ENABLED_SOURCE = f"{TOPIC}/ble/IDX/158" # Wallbox DPM limit
 EVCC_COMMAND_MAXCURRENT = f"{TOPIC}/evcc/maxcurrent"
 EVCC_COMMAND_MAXCURRENTMILLIS = f"{TOPIC}/evcc/maxcurrentmillis"
 EVCC_COMMAND_ENABLE = f"{TOPIC}/evcc/enable"
@@ -84,7 +83,7 @@ class EasyWallbox:
     async def is_connected(self):
         if self.is_demo():
             return await self.state() != self.BLE_STATE_DISCONNECTED
-        return self._client.is_connected()
+        return self._client.is_connected
 
     async def is_connecting(self):
         return await self.state() == self.BLE_STATE_CONNECTING
@@ -102,7 +101,7 @@ class EasyWallbox:
             data = bytearray(data, 'utf-8')
         if not self.is_demo():
             await self._client.write_gatt_char(self.WALLBOX_RX, data)
-        log.debug("ble write: %s", data)
+        log.info("ble write: %s", data)
 
     async def _pair(self):
         state = await self.state()
@@ -202,10 +201,10 @@ class EasyWallbox:
         if enable:
             await self._queue.put(commands.setDpmOff())
         else:
+            await self._queue.put(commands.setDpmOn())
             # this is very tricky - I could not find a way to disable/pause a charge process
             # so the only way is set the limit to 1A so that the DPM will not allow the charge to start
             await self._queue.put(commands.setDpmLimit(1))
-            await self._queue.put(commands.setDpmOn())
 
     def is_evcc_enabled(self):
         return not self._is_dpm_enabled
@@ -231,9 +230,9 @@ class EasyWallbox:
                         if len(chunks) > 3:
                             key = chunks[2]
                             data = chunks[3:]
-                            if key == "AD" and len(data) > 8:
-                                dpm_status = data[8]
-                                log.debug(f"DPM status: {dpm_status}")
+                            if key == "AD" and len(data) > 6:
+                                dpm_status = data[6]
+                                log.info(f"DPM status: {dpm_status}")
                                 self._is_dpm_enabled = (dpm_status != "0")
                             if key in ["AL", "SL", "IDX"]:
                                 key += f"/{data[0]}"
@@ -272,7 +271,6 @@ async def main():
             ,(f"{TOPIC}/settings/+", 0)
             # evcc - status
             ,(EVCC_STATUS_SOURCE, 0)
-            ,(EVCC_ENABLED_SOURCE, 0)
             # evcc - commands
             ,(EVCC_COMMAND_MAXCURRENT, 0), (EVCC_COMMAND_MAXCURRENTMILLIS, 0), (EVCC_COMMAND_ENABLE, 0)
             ])
@@ -296,10 +294,10 @@ async def main():
                         log.warn(f"Unknown EVCC status: {status_code}")
                     await client.publish(f"{TOPIC}/evcc/status", evcc_status, qos=0, retain=False)
                     await client.publish(f"{TOPIC}/evcc/enabled", eb.is_evcc_enabled(), qos=0, retain=False)
-                    break
+                    continue
                 elif topic == EVCC_COMMAND_ENABLE:
                     await eb.evcc_enable(message == "true")
-                    break
+                    continue
                 elif topic == EVCC_COMMAND_MAXCURRENT:
                     max_current = int(message)
                     ble_command = commands.setUserLimit(max_current, millis=False)
@@ -308,7 +306,7 @@ async def main():
                     max_current = int(round(float(message)*10))
                     ble_command = commands.setUserLimit(max_current, millis=True)
 
-                elif topic.starts_with("settings/"):
+                elif topic.startswith("settings/"):
                     opt = topic.split("/", maxsplit=1)[1]
                     log.info(f"Updating setting {opt}={message}")
                     try:
@@ -316,7 +314,7 @@ async def main():
                     except ValueError as e:
                         log.error(f"Invalid settings value for {opt}: {e}")
                     finally:
-                        break
+                        continue
 
                 elif("/" in message):
                     msx = message.split("/") #limit/10
