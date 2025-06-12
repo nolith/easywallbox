@@ -2,7 +2,7 @@
 import asyncio
 import sys
 from bleak import BleakClient
-import paho.mqtt.client as mqtt
+import aiomqtt
 import os
 import commands
 import mqttmap
@@ -20,23 +20,23 @@ logging.basicConfig(format=FORMAT)
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
+TOPIC = os.getenv('WALLBOX_TOPIC', 'easywallbox')
+HOME_ASSISTANT_DISCOVERY = os.getenv('HOME_ASSISTANT_DISCOVERY', 'homeassistant')
 
-EVCC_STATUS_SOURCE = "easywallbox/ble/AD/4"
-EVCC_ENABLED_SOURCE = "easywallbox/ble/IDX/158" # Wallbox DPM limit
-EVCC_COMMAND_MAXCURRENT = "easywallbox/evcc/maxcurrent"
-EVCC_COMMAND_MAXCURRENTMILLIS = "easywallbox/evcc/maxcurrentmillis"
-EVCC_COMMAND_ENABLE = "easywallbox/evcc/enable"
+EVCC_STATUS_SOURCE = f"{TOPIC}/ble/AD/4"
+EVCC_ENABLED_SOURCE = f"{TOPIC}/ble/IDX/158" # Wallbox DPM limit
+EVCC_COMMAND_MAXCURRENT = f"{TOPIC}/evcc/maxcurrent"
+EVCC_COMMAND_MAXCURRENTMILLIS = f"{TOPIC}/evcc/maxcurrentmillis"
+EVCC_COMMAND_ENABLE = f"{TOPIC}/evcc/enable"
 EVCC_STATUS_AVAILABLE = "A"
 EVCC_STATUS_VEHICLE_PRESENT = "B"
 EVCC_STATUS_CHARGING = "C"
 EVCC_STATUS_ERROR = "D"
 
-mqttClient = None
-
 settings = settings.Settings()
 
 class EasyWallbox:
-    WALLBOX_ADDRESS = os.getenv('WALLBOX_ADDRESS', '8C:F6:81:AD:B8:3E')
+    WALLBOX_ADDRESS = os.getenv('WALLBOX_ADDRESS', 'demo')
     WALLBOX_PIN = os.getenv('WALLBOX_PIN', '9844')
     WALLBOX_DPM_LIMIT = int(os.getenv('WALLBOX_DPM_LIMIT', '26'))
     WALLBOX_USER_LIMIT = int(os.getenv('WALLBOX_USER_LIMIT', '23'))
@@ -47,7 +47,7 @@ class EasyWallbox:
     WALLBOX_TX = "a73e9a10-628f-4494-a099-12efaf72258f";
     WALLBOX_UUID ="0A8C44F5-F80D-8141-6618-2564F1881650";
 
-    def __init__(self, queue):
+    def __init__(self, queue, mqtt_client):
         self._client = BleakClient(self.WALLBOX_ADDRESS)
         self._queue = queue
         self._lock = asyncio.Lock()
@@ -55,6 +55,10 @@ class EasyWallbox:
         self.terminating = False
         self.state_timer = RepeatingTimer(self._update_ble_state)
         self._evcc_enabled = True
+        self._mqtt_client = mqtt_client
+
+    def is_demo(self):
+        return self.WALLBOX_ADDRESS == "demo"
 
     def is_connected(self):
         return self._client.is_connected
@@ -66,17 +70,21 @@ class EasyWallbox:
     async def stop(self):
       async with self._lock:
         self.terminating = True
-        client.publish("easywallbox/status/ble", "terminating")
+        await self._mqtt_client.publish(f"{TOPIC}status/ble", "terminating")
         self.state_timer.stop()
 
     async def write(self, data):
         if isinstance(data, str):
             data = bytearray(data, 'utf-8')
-        await self._client.write_gatt_char(self.WALLBOX_RX, data)
+        if not self.is_demo():
+            await self._client.write_gatt_char(self.WALLBOX_RX, data)
         log.info("ble write: %s", data)
 
     async def connect(self):
-        global client
+        if self.is_demo():
+            log.info("demo mode - no real connection")
+            return
+
         try:
             async with self._lock:
                 if self.terminating:
@@ -84,7 +92,7 @@ class EasyWallbox:
                     return
 
                 self.connecting = True
-                client.publish("easywallbox/status/ble", "connecting")
+                await self._mqtt_client.publish(f"{TOPIC}/status/ble", "connecting")
             log.info("Connecting BLE...")
             await self._client.connect()
             log.info(f"Connected on {self.WALLBOX_ADDRESS}: {self._client.is_connected}")
@@ -103,7 +111,7 @@ class EasyWallbox:
 
             async with self._lock:
               self.connecting = False
-              client.publish("easywallbox/status/ble", "connected", qos=1)
+              await self._mqtt_client.publish(f"{TOPIC}/status/ble", "connected", qos=1)
 
             refresh_timer = await settings.get(settings.KEY_BLE_REFRESH_INTERVAL)
             await asyncio.sleep(3)
@@ -111,7 +119,7 @@ class EasyWallbox:
             self.state_timer.start(refresh_timer)
         except Exception as e:
             log.error(f"Failed to connect or pair to device {self.WALLBOX_ADDRESS}: {e}")
-            client.publish("easywallbox/status/ble", f"failed: {e}")
+            await self._mqtt_client.publish(f"{TOPIC}/status/ble", f"failed: {e}")
             retry_in_sec=await settings.get(settings.KEY_BLE_RETRY_INTERVAL)
             log.error("Connection attempts failed. Retrying in {} seconds.".format(retry_in_sec))
             await asyncio.sleep(retry_in_sec)
@@ -138,20 +146,20 @@ class EasyWallbox:
     async def read_voltage(self):
         await self._enqueue_ble_command("READ_SUPPLY_VOLTAGE")
 
-    def evcc_enable(self, enable=True):
+    async def evcc_enable(self, enable=True):
         if self.terminating:
             log.warning("Termitating state, ignoring evcc enable command")
             return
-        
+
         self._evcc_enabled = enable
         if enable:
-            self._queue.put_nowait(commands.setDpmOff())
-            self._queue.put_nowait(commands.setDpmLimit(self.WALLBOX_DPM_LIMIT))
+            await self._queue.put(commands.setDpmOff())
+            await self._queue.put(commands.setDpmLimit(self.WALLBOX_DPM_LIMIT))
         else:
             # this is very tricky - I could not find a way to disable/pause a charge process
             # so the only way is set the limit to 1A so that the DPM will not allow the charge to start
-            self._queue.put_nowait(commands.setDpmLimit(1))
-            self._queue.put_nowait(commands.setDpmOn())
+            await self._queue.put(commands.setDpmLimit(1))
+            await self._queue.put(commands.setDpmOn())
 
     def dpm_limit_changed(self, new_limit):
         self._evcc_enabled = new_limit != "10"
@@ -161,25 +169,23 @@ class EasyWallbox:
 
 
     _notification_buffer_rx = ""
-    def _notification_handler_rx(self, sender, data):
-        global client
+    async def _notification_handler_rx(self, sender, data):
         self._notification_buffer_rx += data.decode()
         if "\n" in self._notification_buffer_rx:
             log.info("_notification RX received: %s", self._notification_buffer_rx)
             try:
-                if (client):
-                    client.publish(topic="easywallbox/message", payload=self._notification_buffer_rx, qos=1, retain=False)
-                    chunks = self._notification_buffer_rx.split(",")
-                    if len(chunks) > 3:
-                        key = chunks[2]
-                        data = chunks[3:]
-                        if key in ["AL", "SL", "IDX"]:
-                            key += f"/{data[0]}"
-                            data = ",".join(data[1:])
-                            client.publish(topic=f"easywallbox/ble/{key}", payload=data, qos=1, retain=True)
-                        else:
-                            for idx, value in enumerate(data):
-                                client.publish(topic=f"easywallbox/ble/{key}/{idx}", payload=value, qos=1, retain=True)
+                await self._mqtt_client.publish(topic=f"{TOPIC}/message", payload=self._notification_buffer_rx, qos=1, retain=False)
+                chunks = self._notification_buffer_rx.split(",")
+                if len(chunks) > 3:
+                    key = chunks[2]
+                    data = chunks[3:]
+                    if key in ["AL", "SL", "IDX"]:
+                        key += f"/{data[0]}"
+                        data = ",".join(data[1:])
+                        await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}", payload=data, qos=1, retain=True)
+                    else:
+                        for idx, value in enumerate(data):
+                            await self._mqtt_client.publish(topic=f"{TOPIC}/ble/{key}/{idx}", payload=value, qos=1, retain=True)
             #self._queue.put_nowait(self._notification_buffer_rx)
             finally:
                 self._notification_buffer_rx = "";
@@ -188,7 +194,7 @@ class EasyWallbox:
         #self._queue.put_nowait(data.decode('utf-8'))
 
     _notification_buffer_st = ""
-    def _notification_handler_st(self, sender, data):
+    async def _notification_handler_st(self, sender, data):
 
         self._notification_buffer_st += data.decode()
         if "\n" in self._notification_buffer_st:
@@ -200,7 +206,6 @@ class EasyWallbox:
         #self._queue.put_nowait(data.decode('utf-8'))
 
 async def main():
-    global client
     mqtt_host = os.getenv('MQTT_HOST', '192.168.2.70')
     mqtt_port = os.getenv('MQTT_PORT', 1883)
     mqtt_username = os.getenv('MQTT_USERNAME', "")
@@ -208,160 +213,143 @@ async def main():
 
     queue = asyncio.Queue()
 
-    eb = EasyWallbox(queue)
 
-    # The callback for when the client receives a CONNACK response from the server.
-    def on_connect(client, userdata, flags, rc):
-        print("Connected to MQTT Broker with result code "+str(rc))
-        client.connected_flag=True
-        log.info("Connected to MQTT Broker!")
-        # Subscribing in on_connect() means that if we lose the connection and
-        # reconnect then subscriptions will be renewed.
-        client.subscribe([
+
+    # The callback for when a PUBLISH message is received from the server.
+    async def on_message(client):
+        await client.subscribe([
             # legacy
-            ("easywallbox/dpm",0), ("easywallbox/charge",0), ("easywallbox/limit",0), ("easywallbox/read", 0)
+            (f"{TOPIC}/dpm",0), (f"{TOPIC}/charge",0), (f"{TOPIC}/limit",0), (f"{TOPIC}/read", 0)
             # settings
-            ,("easywallbox/settings/+", 0)
+            ,(f"{TOPIC}/settings/+", 0)
             # evcc - status
             ,(EVCC_STATUS_SOURCE, 0)
             ,(EVCC_ENABLED_SOURCE, 0)
             # evcc - commands
             ,(EVCC_COMMAND_MAXCURRENT, 0), (EVCC_COMMAND_MAXCURRENTMILLIS, 0), (EVCC_COMMAND_ENABLE, 0)
             ])
+        async for msg in client.messages:
+            topic = msg.topic
+            message = msg.payload.decode()
+            log.info(f"Message received [{topic}]: {message}")
+            ble_command = None
 
+            try:
+                if topic == EVCC_STATUS_SOURCE:
+                    status_code = int(message)
+                    evcc_status = EVCC_STATUS_ERROR
+                    if status_code == 3:
+                        evcc_status =  EVCC_STATUS_AVAILABLE
+                    elif status_code == 6:
+                        evcc_status = EVCC_STATUS_VEHICLE_PRESENT
+                    elif status_code == 8:
+                        evcc_status = EVCC_STATUS_CHARGING
+                    else:
+                        log.warning(f"Unknown EVCC status: {status_code}")
+                    await client.publish(f"{TOPIC}/evcc/status", evcc_status, qos=0, retain=False)
+                    await client.publish(f"{TOPIC}/evcc/enabled", eb.is_evcc_enabled(), qos=0, retain=False)
+                    break
+                elif topic == EVCC_COMMAND_ENABLE:
+                    await eb.evcc_enable(message == "true")
+                    break
+                elif topic == EVCC_COMMAND_MAXCURRENT:
+                    max_current = int(message)
+                    ble_command = commands.setUserLimit(max_current, millis=False)
+                elif topic == EVCC_COMMAND_MAXCURRENTMILLIS:
+                    max_current = int(message)
+                    ble_command = commands.setUserLimit(max_current, millis=True)
 
-    # The callback for when a PUBLISH message is received from the server.
-    def on_message(client, userdata, msg):
-        #print(msg.topic+" "+str(msg.payload))
-        #queue.put_nowait(msg.payload)
+                elif "settings/" in topic:
+                    opt = topic.split("/", maxsplit=1)[1]
+                    log.info(f"Updating setting {opt}={message}")
+                    try:
+                        await settings.set(opt, int(message))
+                    except ValueError as e:
+                        log.error(f"Invalid settings value for {opt}: {e}")
+                    finally:
+                        break
 
-        topic = msg.topic
-        message = msg.payload.decode()
-        log.info(f"Message received [{topic}]: {message}")
-        ble_command = None
-
-        try:
-            if topic == EVCC_STATUS_SOURCE:
-                status_code = int(message)
-                evcc_status = EVCC_STATUS_ERROR
-                if status_code == 3:
-                    evcc_status =  EVCC_STATUS_AVAILABLE
-                elif status_code == 6:
-                    evcc_status = EVCC_STATUS_VEHICLE_PRESENT
-                elif status_code == 8:
-                    evcc_status = EVCC_STATUS_CHARGING
+                elif("/" in message):
+                    msx = message.split("/") #limit/10
+                    if msx[0] == "raw":
+                        log.info(f"Raw command: {msx[1]}")
+                        ble_command = msx[1]
+                    else:
+                        #TODO: Check if msx contains valid values
+                        ble_command = mqttmap.MQTT2BLE[topic][msx[0]+"/"](msx[1])
                 else:
-                    log.warning(f"Unknown EVCC status: {status_code}")
-                client.publish("easywallbox/evcc/status", evcc_status, qos=0, retain=False)
-                client.publish("easywallbox/evcc/enabled", eb.is_evcc_enabled(), qos=0, retain=False)
-                return
-            elif topic == EVCC_COMMAND_ENABLE:
-                eb.evcc_enable(message == "true")
-                return
-            elif topic == EVCC_COMMAND_MAXCURRENT:
-                max_current = int(message)
-                ble_command = commands.setUserLimit(max_current, millis=False)
-            elif topic == EVCC_COMMAND_MAXCURRENTMILLIS:
-                max_current = int(message)
-                ble_command = commands.setUserLimit(max_current, millis=True)
+                    ble_command = mqttmap.MQTT2BLE[topic][message]
+            except Exception:
+                pass
 
-            elif "settings/" in topic:
-                opt = topic.split("/", maxsplit=1)[1]
-                log.info(f"Updating setting {opt}={message}")
-                try:
-                    settings.set_nowait(opt, int(message))
-                except ValueError as e:
-                    log.error(f"Invalid settings value for {opt}: {e}")
-                finally:
-                    return
+            print(ble_command)
 
-            elif("/" in message):
-                msx = message.split("/") #limit/10
-                if msx[0] == "raw":
-                    log.info(f"Raw command: {msx[1]}")
-                    ble_command = msx[1]
-                else:
-                    #TODO: Check if msx contains valid values
-                    ble_command = mqttmap.MQTT2BLE[topic][msx[0]+"/"](msx[1])
-            else:
-                ble_command = mqttmap.MQTT2BLE[topic][message]
-        except Exception:
-            pass
+            if(ble_command != None):
+                await queue.put(ble_command)
 
-        print(ble_command)
+    async with aiomqtt.Client(
+        hostname=mqtt_host, port=mqtt_port,
+        username=mqtt_username, password=mqtt_password,
+        identifier="easywallbox-mqtt",
+        keepalive=60,
+        will=aiomqtt.Will(f"{TOPIC}/status/general", "offline"),
+    ) as client:
+        log.info("[MQTT] Connected.")
 
-        if(ble_command != None):
-            queue.put_nowait(ble_command)
+        eb = EasyWallbox(queue, client)
 
-    async def on_exit():
-        log.info("Shutting down")
-        eb.stop()
-        client.publish("easywallbox/status/general", "offline", qos=1)
-        client.publish("easywallbox/evcc/enabled", "false", qos=1)
-        # restore limits
-        if eb.is_connected():
-            queue.put_nowait(commands.setDpmLimit(eb.WALLBOX_DPM_LIMIT))
-            queue.put_nowait(commands.setDpmOn())
-            queue.put_nowait(commands.setUserLimit(eb.WALLBOX_USER_LIMIT))
-            await asyncio.sleep(5)
-            await eb._client.disconnect()
-        else:
-            log.warninig("Cannot restore default limits, not connected")
+        await client.publish(f"{TOPIC}/status/general", "online", qos=1)
+        await client.publish(f"{TOPIC}/evcc/enabled", "false", qos=1)
 
-        sys.exit(0)
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGINT,
+                            lambda: asyncio.create_task(on_exit(client, eb, queue)))
+        atexit.register(on_exit)
 
-    mqtt.Client.connected_flag=False
+        # Avvia publisher e listener
+        await asyncio.gather(
+            on_message(client),
+            queue_consumer(client, eb, queue),
+        )
 
-    client = mqtt.Client("mqtt-easywallbox")
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.loop_start()
-    client.username_pw_set(username=mqtt_username,password=mqtt_password)
-    client.connect(mqtt_host, mqtt_port, 60)
+async def on_exit(client, eb, queue):
+    log.info("Shutting down")
+    eb.stop()
+    await client.publish(f"{TOPIC}/status/general", "offline", qos=1)
+    await client.publish(f"{TOPIC}/evcc/enabled", "false", qos=1)
+    # restore limits
+    if eb.is_connected():
+        await queue.put(commands.setDpmLimit(eb.WALLBOX_DPM_LIMIT))
+        await queue.put(commands.setDpmOn())
+        await queue.put(commands.setUserLimit(eb.WALLBOX_USER_LIMIT))
+        await asyncio.sleep(5)
+        await eb._client.disconnect()
+    else:
+        log.warn("Cannot restore default limits, not connected")
 
-    while not client.connected_flag: #wait in loop
-        log.info("...")
-        time.sleep(1)
+    sys.exit(0)
 
-    client.publish("easywallbox/status/general", "online", qos=1)
-    client.publish("easywallbox/evcc/enabled", "false", qos=1)
-
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGINT,
-                            lambda: asyncio.create_task(on_exit()))
-    atexit.register(on_exit)
-
-
-    #def read_line():
-    #    line = sys.stdin.readline()
-    #    if line:
-    #        queue.put_nowait(line)
-
-    #task = loop.add_reader(sys.stdin.fileno(), read_line)
-
-
-
+async def queue_consumer(client, eb, queue):
     try:
         while True:
-            if not eb.is_connected() and not await eb.is_connecting():
+            if not eb.is_demo() and not eb.is_connected() and not await eb.is_connecting():
                 log.info("Lost connection to BLE, reconnecting...")
                 await eb.connect()
             elif queue.empty():
                 pass
             else:
-                #item = await queue.get()
-                item = queue.get_nowait()
-                log.info("Consuming ...")
-                if item is None:
-                    log.info("nothing to consume!")
-                    break
-                log.info(f"Consuming item {item}...")
-                await eb.write(item)
+                async with queue.get() as item:
+                    log.info("Consuming ...")
+                    if item is None:
+                        log.info("nothing to consume!")
+                        break
+                    log.info(f"Consuming item {item}...")
+                    await eb.write(item)
             await asyncio.sleep(1)
     except Exception as e:
         log.error(f"Application error: {e}")
     finally:
-        await on_exit()
+        await on_exit(client, eb, queue)
 
 def cli_main():
   try:

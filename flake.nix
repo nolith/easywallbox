@@ -19,7 +19,7 @@
         pythonPackages = pkgs.python312Packages;
         propagatedBuildInputs = with pythonPackages;
           [
-            (pythonPackages.callPackage ./nix/paho.nix {})
+            aiomqtt
           ]
           ++ lib.optional (pkgs.stdenv.isLinux) bleak
           ++ lib.optionals (pkgs.stdenv.isDarwin) [
